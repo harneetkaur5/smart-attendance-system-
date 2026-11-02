@@ -1,0 +1,416 @@
+/*
+  SMART ATTENDANCE SYSTEM
+  Board: NodeMCU ESP8266 (ESP-12E)
+  Modules: MFRC522 RFID, 16x2 I2C LCD, Green LED, Red LED
+
+  Wi-Fi AP:
+    SSID: Smart Attendance
+    Password: Attend123
+    Dashboard: http://192.168.4.1
+
+  Wiring:
+    RC522 SDA/SS -> D8, SCK -> D5, MOSI -> D7, MISO -> D6, RST -> D0
+    LCD SDA -> D2, SCL -> D1
+    Green LED -> D3 through 220-330 ohm resistor
+    Red LED -> D4 through 220-330 ohm resistor
+
+  Install libraries:
+    - ESP8266 board package
+    - MFRC522 by GithubCommunity / Miguel Balboa
+    - LiquidCrystal_I2C by Frank de Brabander
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+
+#define RFID_SS_PIN D8
+#define RFID_RST_PIN D0
+#define GREEN_LED D3
+#define RED_LED D4
+
+const char* AP_SSID = "Smart Attendance";
+const char* AP_PASSWORD = "Attend123";
+
+ESP8266WebServer server(80);
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const uint8_t MAX_STUDENTS = 2;
+const uint16_t EEPROM_SIZE = 512;
+const uint16_t STUDENT_ADDR = 0;
+const uint16_t REPORT_ADDR = 128;
+const uint32_t DB_MAGIC = 0xA7712026;
+const uint32_t REPORT_MAGIC = 0xB7712026;
+
+struct Student {
+  char name[32];
+  char uid[16];
+};
+
+struct StudentDB {
+  uint32_t magic;
+  uint8_t count;
+  Student students[MAX_STUDENTS];
+};
+
+struct SavedReport {
+  uint32_t magic;
+  uint8_t count;
+  Student students[MAX_STUDENTS];
+  uint8_t present[MAX_STUDENTS];
+  uint8_t valid;
+};
+
+Student students[MAX_STUDENTS];
+uint8_t studentCount = 0;
+bool present[MAX_STUDENTS] = {false, false};
+bool classActive = true;
+bool registrationMode = false;
+unsigned long registrationStarted = 0;
+String capturedUID = "";
+String events[50];
+uint8_t eventCount = 0;
+unsigned long lastScanMillis = 0;
+String lastScannedUID = "";
+
+String htmlEscape(const String& s) {
+  String out = s;
+  out.replace("&", "&amp;");
+  out.replace("<", "&lt;");
+  out.replace(">", "&gt;");
+  out.replace("\"", "&quot;");
+  out.replace("'", "&#39;");
+  return out;
+}
+
+void addEvent(const String& message) {
+  if (eventCount < 50) {
+    events[eventCount++] = message;
+  } else {
+    for (int i = 1; i < 50; i++) events[i - 1] = events[i];
+    events[49] = message;
+  }
+}
+
+String uidToString() {
+  String value = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) value += "0";
+    value += String(rfid.uid.uidByte[i], HEX);
+  }
+  value.toUpperCase();
+  return value;
+}
+
+int findStudentByUID(const String& uid) {
+  for (uint8_t i = 0; i < studentCount; i++) {
+    if (uid.equalsIgnoreCase(String(students[i].uid))) return i;
+  }
+  return -1;
+}
+
+void saveStudents() {
+  StudentDB db;
+  memset(&db, 0, sizeof(db));
+  db.magic = DB_MAGIC;
+  db.count = studentCount;
+  for (uint8_t i = 0; i < studentCount; i++) db.students[i] = students[i];
+  EEPROM.put(STUDENT_ADDR, db);
+  EEPROM.commit();
+}
+
+void loadStudents() {
+  StudentDB db;
+  EEPROM.get(STUDENT_ADDR, db);
+  if (db.magic == DB_MAGIC && db.count <= MAX_STUDENTS) {
+    studentCount = db.count;
+    for (uint8_t i = 0; i < studentCount; i++) students[i] = db.students[i];
+  } else {
+    studentCount = 1;
+    memset(students, 0, sizeof(students));
+    strncpy(students[0].name, "Student 1", sizeof(students[0].name) - 1);
+    strncpy(students[0].uid, "12A4E564", sizeof(students[0].uid) - 1);
+    saveStudents();
+  }
+}
+
+void saveCompletedReport() {
+  SavedReport report;
+  memset(&report, 0, sizeof(report));
+  report.magic = REPORT_MAGIC;
+  report.count = studentCount;
+  report.valid = 1;
+  for (uint8_t i = 0; i < studentCount; i++) {
+    report.students[i] = students[i];
+    report.present[i] = present[i] ? 1 : 0;
+  }
+  EEPROM.put(REPORT_ADDR, report);
+  EEPROM.commit();
+}
+
+void setLCD(const String& line1, const String& line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1.substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print(line2.substring(0, 16));
+}
+
+void processCard() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  String uid = uidToString();
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  if (millis() - lastScanMillis < 1200 && uid == lastScannedUID) return;
+  lastScanMillis = millis();
+  lastScannedUID = uid;
+
+  if (registrationMode) {
+    capturedUID = uid;
+    registrationMode = false;
+    addEvent("Registration scan captured: " + uid);
+    setLCD("Card captured", uid);
+    digitalWrite(GREEN_LED, HIGH);
+    delay(250);
+    digitalWrite(GREEN_LED, LOW);
+    return;
+  }
+
+  int index = findStudentByUID(uid);
+  if (index < 0) {
+    addEvent("Unknown card: " + uid);
+    setLCD("Unknown Card", uid);
+    digitalWrite(RED_LED, HIGH);
+    delay(500);
+    digitalWrite(RED_LED, LOW);
+    return;
+  }
+
+  if (!classActive) {
+    addEvent("Scan after class ended: " + String(students[index].name));
+    setLCD("Class Ended", students[index].name);
+    return;
+  }
+
+  if (present[index]) {
+    addEvent("Duplicate scan: " + String(students[index].name));
+    setLCD("Already Present", students[index].name);
+  } else {
+    present[index] = true;
+    addEvent("Attendance marked: " + String(students[index].name));
+    setLCD("Attendance Marked", students[index].name);
+    digitalWrite(GREEN_LED, HIGH);
+    delay(350);
+    digitalWrite(GREEN_LED, LOW);
+  }
+}
+
+String dashboardPage() {
+  String page = R"HTML(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Attendance</title>
+<style>
+*{box-sizing:border-box}body{font-family:Arial,sans-serif;background:#f3f5f8;margin:0;color:#172033}
+header{background:#142b4a;color:white;padding:18px;text-align:center}main{max-width:850px;margin:18px auto;padding:0 12px}
+.card{background:white;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 2px 10px #0001}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#edf3fa;padding:12px;border-radius:9px;text-align:center}
+.stat b{font-size:22px;display:block}button{border:0;border-radius:7px;padding:11px 14px;margin:4px;background:#1769aa;color:white;font-weight:bold}
+.danger{background:#c0392b}.green{background:#16834a}input{padding:11px;border:1px solid #ccd3dc;border-radius:7px;margin:4px;max-width:100%}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:10px;border-bottom:1px solid #e5e9ef}
+small{color:#64748b}.events{max-height:220px;overflow:auto}.event{padding:7px;border-bottom:1px solid #eee}
+@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+</style></head><body><header><h2>Smart Attendance</h2><div>RFID Attendance Dashboard</div></header><main>
+<div class="card"><div class="stats">
+<div class="stat"><b id="total">0</b><small>Total</small></div>
+<div class="stat"><b id="presents">0</b><small>Present</small></div>
+<div class="stat"><b id="absents">0</b><small>Absent</small></div>
+<div class="stat"><b id="percent">0%</b><small>Attendance</small></div></div>
+<p id="classState">Loading...</p></div>
+<div class="card"><h3>Attendance</h3><div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>UID</th><th>Status</th></tr></thead><tbody id="roster"></tbody></table></div></div>
+<div class="card"><h3>Register Student</h3><input id="studentName" placeholder="Student name"><button onclick="scanCard()">Scan RFID Card</button><button class="green" onclick="saveStudent()">Save Student</button><p id="scanStatus"><small>Enter a name, scan a card, then save.</small></p></div>
+<div class="card"><h3>Manage Students</h3><div id="manage"></div></div>
+<div class="card"><h3>Class Controls</h3><button class="danger" onclick="endClass()">End Class</button><button class="green" onclick="newClass()">Start New Class</button><a href="/report.csv"><button>Download CSV Report</button></a></div>
+<div class="card"><h3>Live Events</h3><div class="events" id="events"></div></div>
+</main><script>
+async function refresh(){try{let r=await fetch('/api');let d=await r.json();
+document.getElementById('total').textContent=d.total;document.getElementById('presents').textContent=d.present;
+document.getElementById('absents').textContent=d.absent;document.getElementById('percent').textContent=d.percent+'%';
+document.getElementById('classState').textContent=d.active?'Class is ACTIVE':'Class has ENDED';
+document.getElementById('roster').innerHTML=d.students.map((s,i)=>`<tr><td>${esc(s.name)}</td><td>${esc(s.uid)}</td><td>${s.present?'Present':'Absent'}</td></tr>`).join('');
+document.getElementById('manage').innerHTML=d.students.map((s,i)=>`<button class="danger" onclick="removeStudent(${i})">Remove ${esc(s.name)}</button>`).join('');
+document.getElementById('events').innerHTML=d.events.slice().reverse().map(e=>`<div class="event">${esc(e)}</div>`).join('');
+}catch(e){}}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function scanCard(){document.getElementById('scanStatus').textContent='Tap RFID card on the reader within 30 seconds...';await fetch('/scan-start');}
+async function saveStudent(){let name=document.getElementById('studentName').value;let r=await fetch('/student-add?name='+encodeURIComponent(name));let t=await r.text();document.getElementById('scanStatus').textContent=t;refresh();}
+async function removeStudent(i){if(confirm('Remove this student?')){let r=await fetch('/student-remove?id='+i);alert(await r.text());refresh();}}
+async function endClass(){if(confirm('End this class and save the report?')){let r=await fetch('/end');alert(await r.text());refresh();}}
+async function newClass(){if(confirm('Start a new class?')){let r=await fetch('/new');alert(await r.text());refresh();}}
+setInterval(refresh,1000);refresh();
+</script></body></html>
+)HTML";
+  return page;
+}
+
+void handleRoot() { server.send(200, "text/html", dashboardPage()); }
+
+void handleAPI() {
+  uint8_t p = 0;
+  for (uint8_t i = 0; i < studentCount; i++) if (present[i]) p++;
+  uint8_t a = studentCount - p;
+  int percent = studentCount ? (int)(p * 100 / studentCount) : 0;
+
+  String json = "{\"total\":" + String(studentCount) + ",\"present\":" + String(p) +
+                ",\"absent\":" + String(a) + ",\"percent\":" + String(percent) +
+                ",\"active\":" + String(classActive ? "true" : "false") + ",\"students\":[";
+  for (uint8_t i = 0; i < studentCount; i++) {
+    if (i) json += ",";
+    json += "{\"name\":\"" + htmlEscape(String(students[i].name)) + "\",\"uid\":\"" +
+            String(students[i].uid) + "\",\"present\":" + String(present[i] ? "true" : "false") + "}";
+  }
+  json += "],\"events\":[";
+  for (uint8_t i = 0; i < eventCount; i++) {
+    if (i) json += ",";
+    String e = events[i];
+    e.replace("\\", "\\\\"); e.replace("\"", "\\\"");
+    json += "\"" + e + "\"";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handleScanStart() {
+  if (!classActive) { server.send(403, "text/plain", "Class has ended. Start a new class first."); return; }
+  if (studentCount >= MAX_STUDENTS) { server.send(400, "text/plain", "Maximum of 2 students reached."); return; }
+  registrationMode = true;
+  capturedUID = "";
+  registrationStarted = millis();
+  addEvent("Registration scan started");
+  server.send(200, "text/plain", "Scan mode started. Tap a card.");
+}
+
+void handleStudentAdd() {
+  String name = server.arg("name");
+  name.trim();
+  if (name.length() == 0) { server.send(400, "text/plain", "Enter a student name."); return; }
+  if (studentCount >= MAX_STUDENTS) { server.send(400, "text/plain", "Maximum of 2 students reached."); return; }
+  if (capturedUID.length() == 0) { server.send(400, "text/plain", "No card captured. Click Scan RFID Card and tap a card."); return; }
+  if (findStudentByUID(capturedUID) >= 0) { capturedUID = ""; server.send(409, "text/plain", "This card is already registered."); return; }
+
+  memset(&students[studentCount], 0, sizeof(Student));
+  name.toCharArray(students[studentCount].name, sizeof(students[studentCount].name));
+  capturedUID.toCharArray(students[studentCount].uid, sizeof(students[studentCount].uid));
+  present[studentCount] = false;
+  studentCount++;
+  saveStudents();
+  addEvent("Student added: " + name);
+  capturedUID = "";
+  server.send(200, "text/plain", "Student registered successfully.");
+}
+
+void handleStudentRemove() {
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= studentCount) { server.send(400, "text/plain", "Invalid student."); return; }
+  String removed = students[id].name;
+  for (int i = id; i < studentCount - 1; i++) {
+    students[i] = students[i + 1];
+    present[i] = present[i + 1];
+  }
+  studentCount--;
+  memset(&students[studentCount], 0, sizeof(Student));
+  present[studentCount] = false;
+  saveStudents();
+  addEvent("Student removed: " + removed);
+  server.send(200, "text/plain", "Student removed.");
+}
+
+void handleEndClass() {
+  if (!classActive) { server.send(200, "text/plain", "Class is already ended."); return; }
+  saveCompletedReport();
+  classActive = false;
+  registrationMode = false;
+  addEvent("Class ended and report saved");
+  setLCD("Class Ended", "Report Saved");
+  server.send(200, "text/plain", "Class ended. Report saved to device memory.");
+}
+
+void handleNewClass() {
+  if (classActive) { server.send(400, "text/plain", "End the current class first."); return; }
+  for (uint8_t i = 0; i < MAX_STUDENTS; i++) present[i] = false;
+  classActive = true;
+  eventCount = 0;
+  addEvent("New class started");
+  setLCD("New Class", "Ready to scan");
+  server.send(200, "text/plain", "New class started. Student list preserved.");
+}
+
+void handleCSV() {
+  String csv = "Name,UID,Status\r\n";
+  for (uint8_t i = 0; i < studentCount; i++) {
+    csv += "\"" + String(students[i].name) + "\"," + String(students[i].uid) + ",";
+    csv += present[i] ? "Present" : "Absent";
+    csv += "\r\n";
+  }
+  uint8_t p = 0;
+  for (uint8_t i = 0; i < studentCount; i++) if (present[i]) p++;
+  csv += "\r\nTotal," + String(studentCount) + "\r\nPresent," + String(p) +
+         "\r\nAbsent," + String(studentCount - p) + "\r\n";
+  server.sendHeader("Content-Disposition", "attachment; filename=attendance_report.csv");
+  server.send(200, "text/csv", csv);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+
+  Wire.begin(D2, D1);
+  lcd.init();
+  lcd.backlight();
+  setLCD("Smart Attendance", "Starting...");
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadStudents();
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("Dashboard: http://");
+  Serial.println(ip);
+
+  server.on("/", handleRoot);
+  server.on("/api", handleAPI);
+  server.on("/scan-start", handleScanStart);
+  server.on("/student-add", handleStudentAdd);
+  server.on("/student-remove", handleStudentRemove);
+  server.on("/end", handleEndClass);
+  server.on("/new", handleNewClass);
+  server.on("/report.csv", handleCSV);
+  server.begin();
+
+  addEvent("System started");
+  setLCD("WiFi Ready", "192.168.4.1");
+}
+
+void loop() {
+  server.handleClient();
+  if (registrationMode && millis() - registrationStarted > 30000) {
+    registrationMode = false;
+    capturedUID = "";
+    addEvent("Registration scan timed out");
+    setLCD("Scan Timeout", "Try again");
+  }
+  processCard();
+}
